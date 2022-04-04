@@ -25,6 +25,8 @@ class Configuration:
         parser.add_argument("--api_key", dest="api_key",
                             help="api key to grafana", required=False, default='-1')
         parser.add_argument("--dir", dest="dir", required=False, default='-1')
+        parser.add_argument("--dashboards_as_files", dest="dashboards_as_files", required=False, default='-1')
+        parser.add_argument("--set_default_datasource", dest="set_default_datasource", required=False, default='-1')
         args = parser.parse_args()
         for k in vars(args).keys():
             output[k] = vars(args)[k]

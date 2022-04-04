@@ -2,11 +2,28 @@ import sys
 import requests
 import os
 import json
-import string
 from config import Configuration
 import pymysql.cursors # pip install PyMySQL
 import psycopg2
 import psycopg2.extras
+import unicodedata
+import re
+
+def slugify(value, allow_unicode=False):
+    """
+    Taken from https://github.com/django/django/blob/master/django/utils/text.py
+    Convert to ASCII if 'allow_unicode' is False. Convert spaces or repeated
+    dashes to single dashes. Remove characters that aren't alphanumerics,
+    underscores, or hyphens. Convert to lowercase. Also strip leading and
+    trailing whitespace, dashes, and underscores.
+    """
+    value = str(value)
+    if allow_unicode:
+        value = unicodedata.normalize('NFKC', value)
+    else:
+        value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+    value = re.sub(r'[^\w\s-]', '', value.lower())
+    return re.sub(r'[-\s]+', '-', value).strip('-_')
 
 def write_to_file(dir:str,filename:str,to_write:dict)->None:
     tmp = open(os.path.join(dir, filename), 'w')
@@ -130,17 +147,24 @@ def export_from_grafana(config)->None:
     dir = config['dir']
 
     headers = {f'Authorization': f'Bearer {api_key}'}
+
     output = {}
 
-    for setting in ['datasources','folders']:
-        r = requests.get(f'{server}/api/{setting}', headers=headers, verify=False)
-        output[setting] = r.json()
-        #write_to_file(dir, f'{setting}.json', {setting: r.json()})
+    #print(headers)
+    r = requests.get(f'{server}/api/datasources', headers=headers, verify=False)
+    if r.status_code == 200:
+        output['datasources'] = r.json()
+    else:
+        output['datasources'] = []
+
+    r = requests.get(f'{server}/api/folders', headers=headers, verify=False)
+    print('folders', r.reason)
+    output['folders'] = r.json()
 
     ##############
     # teams
     r = requests.get(f'{server}/api/teams/search?query=&', headers=headers, verify=False)
-    output['teams'] =  r.json()['teams']
+    output['teams'] = r.json()
 
     ##############
     # folder permissions
@@ -191,9 +215,30 @@ def export_from_grafana(config)->None:
     for setting in output:
         write_to_file(dir, f'{setting}.json', output[setting])
 
+    if config['dashboards_as_files'] == 'True':
+        default_datasource = ''
+        if 'datasources' in output.keys():
+            for temp in output['datasources']:
+                if temp['isDefault']:
+                    default_datasource = temp['name']
+        for dashboard in output['dashboards']:
+            ####
+            # replace default data source by name
+            if 'panels' in dashboard.keys() and default_datasource != '':
+                for panel in dashboard['panels']:
+                    if 'panels' in dashboard.keys():
+                        for panel in dashboard['panels']:
+                            if panel['datasource'] == None:
+                                panel['datasource'] = default_datasource
+            if 'templating' in dashboard.keys() and default_datasource != '':
+                for variable in dashboard['templating']['list']:
+                    if 'datasource' in variable.keys() and variable['datasource'] == None:
+                        variable['datasource'] = default_datasource
+            if 'folderTitle' in dashboard.keys() and 'title' in dashboard.keys():
+                write_to_file(dir, slugify(dashboard['folderTitle']) + "_" + slugify(dashboard['title']) + '.json', dashboard)
+
 def import_to_grafana(config)->None:
     server = config['import_srv']
-    api_key = config['api_key']
     dir = config['dir']
     to_input = {}
 
@@ -203,7 +248,35 @@ def import_to_grafana(config)->None:
         to_input[setting] = json.load(f)
         f.close()
 
+    #####
+    # get default data source
+    default_datasource = None
+    for temp in to_input['datasources']:
+        if temp['isDefault']:
+            default_datasource = temp['name']
+    if config['set_default_datasource'] != '-1':
+        default_datasource = config['set_default_datasource']
+
+    headers = {}
+    api_key = config['api_key']
     headers = {f'Authorization': f'Bearer {api_key}'}
+
+    #if config['update_dashboards_only'] != '-1' and config['update_dashboards_only']== 'True':
+    #    for dashboard in to_input['dashboards']:
+    #        if 'panels' in dashboard.keys():
+    #            for panel in dashboard['panels']:
+    #                if panel['datasource'] == None:
+    #                    panel['datasource'] = default_datasource
+    #        if 'templating' in dashboard.keys():
+    #            for variable in dashboard['templating']['list']:
+    #                if 'datasource' in variable.keys() and variable['datasource'] == None:
+    #                    variable['datasource'] = default_datasource
+    #        r = requests.post(f'{server}/api/dashboards/db', headers=headers,
+    #                          json={'dashboard': dashboard, 'overwrite': True},
+    #                          verify=False)
+    #        print( dashboard['title'], r.json())
+    #    return None
+
     ####
     # import datasources
     print('import data sources')
@@ -212,8 +285,9 @@ def import_to_grafana(config)->None:
         r = requests.post(f'{server}/api/datasources', headers=headers, json=datasource, verify=False)
         print(r.json())
 
-    print('add datasource secrets directly to database')
-    import_datasources_to_db(config['db_server'],
+    if len(to_input['datasource_from_db'].keys()) > 0:
+        print('add datasource secrets directly to database')
+        import_datasources_to_db(config['db_server'],
                             config['db_user'],
                             config['db_password'],
                             config['db_name'],
@@ -270,15 +344,39 @@ def import_to_grafana(config)->None:
     # import dashboards
     print('import dashboards')
     for dashboard in to_input['dashboards']:
-        folderTitle = dashboard['folderTitle'].upper()
+        folderTitle = ""
+        if 'folderTitle' in dashboard.keys():
+            folderTitle = dashboard['folderTitle'].upper()
+        else:
+            for input_folder in to_input['folders']:
+                if input_folder['uid'] == dashboard['folderUid']:
+                    folderTitle = input_folder['title'].upper()
+                    break
         del dashboard['id']
+        if folderTitle == "":
+            print('###################\n not find folder for dashboard with folder uid',
+                  dashboard['folderUid'], dashboard['title'] )
+            continue
         try:
             folderUid = current_folders[folderTitle]['uid']
         except Exception as e:
-            print("###################\n ERROR ", e, dashboard['folderTitle'], "\n###################")
+            print("###################\n ERROR ", e, dashboard['title'], "\n###################")
             continue
         del dashboard['folderUid']
-        del dashboard['folderTitle']
+        if 'folderTitle' in dashboard.keys():
+            del dashboard['folderTitle']
+        ####
+        # replace default data source by name
+        if 'panels' in dashboard.keys():
+            for panel in dashboard['panels']:
+                if 'panels' in dashboard.keys():
+                    for panel in dashboard['panels']:
+                        if panel['datasource'] == None:
+                            panel['datasource'] = default_datasource
+        if 'templating' in dashboard.keys():
+            for variable in dashboard['templating']['list']:
+                if 'datasource' in variable.keys() and variable['datasource'] == None:
+                    variable['datasource'] = default_datasource
         r = requests.post(f'{server}/api/dashboards/db', headers=headers,
                           json={'dashboard':dashboard,'folderUid':folderUid,'overwrite':True},
                           verify=False)
